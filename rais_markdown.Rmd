@@ -1,0 +1,1084 @@
+---
+title: "Prova *  Análise de Dados da RAIS *  Luiz Mario"
+output:
+  html_document: default
+  pdf_document: default
+date: "2025-10-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE, echo = TRUE)  # padrão: não executa
+```
+
+## Introdução
+
+Este arquivo R Markdown apresenta análises com dados da Relação Anual de Informações Sociais (RAIS), disponibilizados pelo Ministério do Trabalho e Emprego e previamente tratados e organizados em tabelas pela plataforma Base dos Dados. O objetivo é extrair informações a partir de uma base agregada por **município-ano** para os anos de **2010, 2014 e 2018**, contemplando:
+
+-   **Vínculos de emprego (CLT e setor público)**
+    -   **CLT**: identificar pelo campo `tipo_vinculo` (conforme dicionário da RAIS).
+    -   **Setor público**: identificar pelo `subsetor_atividade_ibge` (e dicionário; ex.: Administração Pública).
+    -   **Métricas**: número de vínculos (contagem) e salário médio para cada grupo (CLT e setor público).
+    -   **Checagens**: verificar se **CLT + setor público ≤ emprego total**; documentar filtros aplicados.
+-   **Evolução e distribuição salarial (por vínculo e raça/cor)**
+    -   **Salário médio**: total, CLT e setor público.
+    -   **Recortes de raça/cor**: brancos e negros (pretos + pardos).
+    -   **Regras**: excluir remunerações nulas/`NA` do denominador e registrar o **N** utilizado.
+    -   **Produtos**: séries (2010, 2014, 2018), boxplots/histogramas por vínculo e raça/cor, e mapas temáticos.
+-   **Evolução da razão salarial entre brancos e negros**
+    -   **Fórmula**: `razão = salário_médio(brancos) / salário_médio(negros)`.
+    -   **Cálculo por categoria**: total, CLT e setor público; por município/UF e para o Brasil.
+    -   **Visualizações**: mapas com dispersão espacial; linhas de evolução (2010–2018); distribuição (boxplots e densidades).
+
+Para realizar a coleta dos microdados, utilizamos os seguintes pacotes:
+
+-   `basedosdados` e `bigrquery`: responsáveis pela conexão com o Google BigQuery, execução das consultas SQL e download das tabelas da RAIS.
+-   `data.table`: armazenamento e manipulação eficiente de grandes volumes de dados. Poderia ser usado também o `tidyverse`, porém o `data.table` costuma ser mais performático em bases muito grandes.
+-   `glue`: construção de SQL parametrizado por ano.
+-   `tidyverse (dplyr)`: padronização de tipos e empilhamento de data frames antes da conversão para `data.table`.
+
+```{r, message=FALSE}
+# Instalação e carregamento (caso ainda não estejam instalados)
+pkgs <-  c("basedosdados","bigrquery","data.table","dplyr","ggplot2","glue","scales")
+to_install <-  setdiff(pkgs, rownames(installed.packages()))
+if (length(to_install)) install.packages(to_install, dependencies = TRUE)
+invisible(lapply(pkgs, library, character.only = TRUE))
+```
+
+Com isso, pode-se já compreender a montagem da tabela final a ser agregada posteriormente da seguinte maneira:
+
+```{r, message=FALSE}
+#Configuração de diretório temporário 
+temp_dir <-  "F:/Luiz_RAIS_Temp/temp_big"
+dir.create(temp_dir, showWarnings = FALSE, recursive = TRUE)
+Sys.setenv(TMPDIR = temp_dir, TEMP = temp_dir, TMP = temp_dir)
+#Configurando a id do projeto no google cloud
+set_billing_id("rais-455114") 
+```
+
+Agora se inicia o processo de busca e download das tabelas da RAIS via API da base dos dados, como é uma base muito grande, foi necessário organizar esse download usando um filtro de anos para 2010,2014 e 2018. Fazendo com que a query baixasse somente os dados correspondentes a esses anos em específico.
+
+### 
+
+### Como funciona a função `baixar_dados_por_ano()`
+
+A função encapsula toda a **extração no BigQuery** para um único ano:
+
+1.  **Parâmetros**
+    -   `ano`: ano-alvo (ex.: 2010, 2014, 2018).\
+    -   `max_tentativas`: número de retries em caso de erro (padrão = 3).
+2.  **Montagem da SQL (com `glue`)**
+    -   Insere `WHERE ano = {ano}` para **filtrar o recorte anual**.\
+    -   Usa CTEs para **“dicionários”** (RAIS) e faz **JOINs** com os **diretórios do Brasil** (UF, município, CNAE):
+        -   Dicionários: `tipo_vinculo`, `grau_instrucao_1985_2005`, `grau_instrucao_apos_2005`, `sexo`, `raca_cor`, `indicador_portador_deficiencia`, `tipo_deficiencia`.\
+        -   Diretórios: `uf`, `municipio`, `cnae_1` (para trazer descrições/nomes legíveis).
+3.  **Execução e download (com `bigrquery`)**
+    -   `bq_project_query(get_billing_id(), query)`: envia a SQL ao BigQuery.\
+    -   `bq_table_download(.., page_size = 10000, max_connections = 1, bigint = "character")`: baixa os dados de forma **estável** e evitando problemas de `integer64`.
+4.  **Mecanismo de retry**
+    -   Envolto em `tryCatch`: se falhar, **log** da tentativa, **`Sys.sleep(5)`** e nova tentativa até `max_tentativas`.\
+    -   Se todas falharem, interrompe com `stop()` informando o ano problemático.
+5.  **Retorno**
+    -   Um `data.frame` com colunas já **enriquecidas** (ano, UF, município, descrições de CNAE e tipo de vínculo, remunerações mensais, salário contratual, subsetor IBGE, idade, sexo, raça/cor, PCD etc.), pronto para padronização de tipos e união com outros anos.
+
+------------------------------------------------------------------------
+
+### Checkpoints por ano: por que e como usamos
+
+Como a RAIS é volumosa e sujeita a **timeouts/quotas**, adotamos **checkpoints anuais** para garantir robustez e economia de tempo/custos.
+
+**O que é o checkpoint?**\
+Um **snapshot em disco** (arquivo `.rds`) com o resultado **completo** de cada ano assim que o download termina. Ex.: `rais_2010_completo.rds`.
+
+**Como o loop implementa**\
+1. `lista_dfs <-  list()` cria o contêiner em memória.\
+2. Para cada `ano` em `anos`, definimos `arquivo_checkpoint <- paste0("rais_", ano, "_completo.rds")`.\
+3. Baixamos com `baixar_dados_por_ano(ano)`.\
+4. **Persistimos** imediatamente: `saveRDS(..., file = arquivo_checkpoint)` → **checkpoint salvo**.\
+5. `Sys.sleep(5)` dá um intervalo para reduzir *throttling*.\
+6. Tudo em `tryCatch`: se um ano falhar, o erro é logado e o loop **continua** (os anos já concluídos permanecem válidos).
+
+**Vantagens práticas**\
+\* **Resiliência**: se a sessão cair após concluir 2010 e 2014, esses anos já estão prontos.\
+\* **Menos custo/tempo**: evita refazer consultas caras no BigQuery.\
+\* **Rastreabilidade**: um arquivo por ano facilita auditoria e reprocessamentos seletivos.\
+\* **Isolamento de problemas**: um esquema alterado em ano específico não bloqueia os demais.
+
+### Variáveis selecionadas na query e por que estão no SELECT
+
+**Chaves temporais e geográficas**
+
+-   `ano`: ancora a dimensão temporal para montar o painel **município-ano**.
+
+-   `sigla_uf` e `sigla_uf_nome` (join no diretório de UFs): código e **nome legível** do estado para agregações e relatórios.
+
+-   `id_municipio` e `id_municipio_nome` (join no diretório de municípios): código IBGE e **nome do município**; essenciais para o nível de observação e para evitar joins adicionais só para rotular.
+
+**Tipo de vínculo**
+
+-   `tipo_vinculo` (de `descricao_tipo_vinculo` via dicionário): identifica **CLT, estatutário, aprendiz, temporário** etc.; é a base para separar **emprego CLT** e **setor público** nas suas métricas.
+
+**Remuneração e salário**
+
+-   `valor_remuneracao_media`: remuneração média informada no ano; é a **primeira escolha** para construir o `salario_aproximado`.
+
+-   `valor_remuneracao_janeiro` … `valor_remuneracao_dezembro` (12 colunas): remunerações **mensais** permitem:\
+
+    1)  fallback quando a média anual estiver ausente/inválida (usar `rowMeans`),\
+    2)  análises de **sazonalidade** e checagens de qualidade.
+
+-   `valor_salario_contratual`: salário do contrato; serve como **último fallback** no cálculo do salário e permite comparar **pago vs contratual**.
+
+**Setor econômico (classificação de atividades)**
+
+-   `subsetor_ibge`: código de subsetor segundo IBGE; útil para **identificar Administração Pública** e derivar **setor público** conforme sua regra.
+
+-   `cnae_1` + descrições do diretório:
+
+-   `cnae_1_descricao`, `cnae_1_descricao_grupo`, `cnae_1_descricao_divisao`, `cnae_1_descricao_secao`: trazem **rótulos legíveis** em diferentes níveis (seção→divisão→grupo) para agregações setoriais e relatórios.
+
+-   `cnae_2`: código CNAE mais recente; incluído para **compatibilidade** e análises que queiram usar a versão atual da classificação (permite ponte entre versões).
+
+**Perfil demográfico e educacional**
+
+-   `idade`: controla composição etária, filtros (p.ex., idades extremas) e análises de distribuição de salários por idade.
+
+-   `grau_instrucao_1985_2005` e `grau_instrucao_apos_2005` (descrições via dicionários): ambas entram para **compatibilidade histórica**; para 2010+ a relevante é a **pós-2005**, mas manter as duas evita quebras se a consulta for generalizada a anos anteriores.
+
+-   `sexo` (descrição via dicionário): necessário para recortes **homens/mulheres**.
+
+-   `raca_cor` (descrição via dicionário): essencial para calcular as métricas por raça/cor (ex.: **razão salarial brancos/negros**).
+
+**Por que trazer também os “nomes/descrições” via diretórios/dicionários?**\
+Para ter **dados analíticos e rótulos legíveis no mesmo dataset** (UF/município/CNAE/tipo de vínculo), reduzindo a necessidade de novos JOINs e facilitando QA, relatórios e visualizações.
+
+```{r, message=FALSE}
+baixar_dados_por_ano <- function(ano, max_tentativas = 3) {
+  message(paste("Baixando dados de", ano, "..."))
+
+  query <- glue::glue("
+  WITH 
+  dados_filtrados AS (
+    SELECT *
+    FROM `basedosdados.br_me_rais.microdados_vinculos`
+    WHERE ano = {ano}
+  ),
+  dicionario_tipo_vinculo AS (
+    SELECT chave AS chave_tipo_vinculo, valor AS descricao_tipo_vinculo
+    FROM `basedosdados.br_me_rais.dicionario`
+    WHERE nome_coluna = 'tipo_vinculo' AND id_tabela = 'microdados_vinculos'
+  ),
+  dicionario_grau_instrucao_1985_2005 AS (
+    SELECT chave AS chave_grau_instrucao_1985_2005, valor AS descricao_grau_instrucao_1985_2005
+    FROM `basedosdados.br_me_rais.dicionario`
+    WHERE nome_coluna = 'grau_instrucao_1985_2005' AND id_tabela = 'microdados_vinculos'
+  ),
+  dicionario_grau_instrucao_apos_2005 AS (
+    SELECT chave AS chave_grau_instrucao_apos_2005, valor AS descricao_grau_instrucao_apos_2005
+    FROM `basedosdados.br_me_rais.dicionario`
+    WHERE nome_coluna = 'grau_instrucao_apos_2005' AND id_tabela = 'microdados_vinculos'
+  ),
+  dicionario_sexo AS (
+    SELECT chave AS chave_sexo, valor AS descricao_sexo
+    FROM `basedosdados.br_me_rais.dicionario`
+    WHERE nome_coluna = 'sexo' AND id_tabela = 'microdados_vinculos'
+  ),
+  dicionario_raca_cor AS (
+    SELECT chave AS chave_raca_cor, valor AS descricao_raca_cor
+    FROM `basedosdados.br_me_rais.dicionario`
+    WHERE nome_coluna = 'raca_cor' AND id_tabela = 'microdados_vinculos'
+  ),
+  dicionario_indicador_portador_deficiencia AS (
+    SELECT chave AS chave_indicador_portador_deficiencia, valor AS descricao_indicador_portador_deficiencia
+    FROM `basedosdados.br_me_rais.dicionario`
+    WHERE nome_coluna = 'indicador_portador_deficiencia' AND id_tabela = 'microdados_vinculos'
+  ),
+  dicionario_tipo_deficiencia AS (
+    SELECT chave AS chave_tipo_deficiencia, valor AS descricao_tipo_deficiencia
+    FROM `basedosdados.br_me_rais.dicionario`
+    WHERE nome_coluna = 'tipo_deficiencia' AND id_tabela = 'microdados_vinculos'
+  )
+  SELECT
+    dados.ano as ano,
+    dados.sigla_uf AS sigla_uf,
+    diretorio_sigla_uf.nome AS sigla_uf_nome,
+    dados.id_municipio AS id_municipio,
+    diretorio_id_municipio.nome AS id_municipio_nome,
+    -- alias padronizado que você usa depois:
+    descricao_tipo_vinculo AS tipo_vinculo,
+    dados.valor_remuneracao_media,
+    dados.valor_remuneracao_janeiro,
+    dados.valor_remuneracao_fevereiro,
+    dados.valor_remuneracao_marco,
+    dados.valor_remuneracao_abril,
+    dados.valor_remuneracao_maio,
+    dados.valor_remuneracao_junho,
+    dados.valor_remuneracao_julho,
+    dados.valor_remuneracao_agosto,
+    dados.valor_remuneracao_setembro,
+    dados.valor_remuneracao_outubro,
+    dados.valor_remuneracao_novembro,
+    dados.valor_remuneracao_dezembro,
+    dados.valor_salario_contratual,
+    dados.subsetor_ibge,
+    dados.cnae_1,
+    diretorio_cnae_1.descricao AS cnae_1_descricao,
+    diretorio_cnae_1.descricao_grupo AS cnae_1_descricao_grupo,
+    diretorio_cnae_1.descricao_divisao AS cnae_1_descricao_divisao,
+    diretorio_cnae_1.descricao_secao AS cnae_1_descricao_secao,
+    dados.cnae_2,
+    dados.idade,
+    descricao_grau_instrucao_1985_2005 AS grau_instrucao_1985_2005,
+    descricao_grau_instrucao_apos_2005 AS grau_instrucao_apos_2005,
+    descricao_sexo AS sexo,
+    descricao_raca_cor AS raca_cor,
+    descricao_indicador_portador_deficiencia AS indicador_portador_deficiencia,
+    descricao_tipo_deficiencia AS tipo_deficiencia
+  FROM dados_filtrados AS dados
+  LEFT JOIN (SELECT DISTINCT sigla, nome FROM `basedosdados.br_bd_diretorios_brasil.uf`) AS diretorio_sigla_uf
+    ON dados.sigla_uf = diretorio_sigla_uf.sigla
+  LEFT JOIN (SELECT DISTINCT id_municipio, nome FROM `basedosdados.br_bd_diretorios_brasil.municipio`) AS diretorio_id_municipio
+    ON dados.id_municipio = diretorio_id_municipio.id_municipio
+  LEFT JOIN dicionario_tipo_vinculo
+    ON dados.tipo_vinculo = chave_tipo_vinculo
+  LEFT JOIN (SELECT DISTINCT cnae_1, descricao, descricao_grupo, descricao_divisao, descricao_secao FROM `basedosdados.br_bd_diretorios_brasil.cnae_1`) AS diretorio_cnae_1
+    ON dados.cnae_1 = diretorio_cnae_1.cnae_1
+  LEFT JOIN dicionario_grau_instrucao_1985_2005
+    ON dados.grau_instrucao_1985_2005 = chave_grau_instrucao_1985_2005
+  LEFT JOIN dicionario_grau_instrucao_apos_2005
+    ON dados.grau_instrucao_apos_2005 = chave_grau_instrucao_apos_2005
+  LEFT JOIN dicionario_sexo
+    ON dados.sexo = chave_sexo
+  LEFT JOIN dicionario_raca_cor
+    ON dados.raca_cor = chave_raca_cor
+  LEFT JOIN dicionario_indicador_portador_deficiencia
+    ON dados.indicador_portador_deficiencia = chave_indicador_portador_deficiencia
+  LEFT JOIN dicionario_tipo_deficiencia
+    ON dados.tipo_deficiencia = chave_tipo_deficiencia
+  ")
+
+  for (tentativa in 1:max_tentativas) {
+    ok <- try({
+      tb <- bq_project_query(x = basedosdados::get_billing_id(), query = as.character(query))
+      df <- bq_table_download(tb, page_size = 10000, max_connections = 1, bigint = "character")
+      message(paste("Download de", ano, "concluído! Total de linhas:", nrow(df)))
+      return(df)
+    }, silent = TRUE)
+    if (!inherits(ok, "try-error")) break
+    message(sprintf("Tentativa %d falhou; aguardando 5s...", tentativa))
+    Sys.sleep(5)
+    if (tentativa == max_tentativas) stop(sprintf("Falha ao baixar %s após %d tentativas", ano, max_tentativas))
+  }
+}
+
+
+#Definição de anos de interesse
+anos <-  c(2010, 2014, 2018)
+#Função sendo executada e construção dos dataframes
+lista_dfs <-  list()
+for (ano in anos) {
+arquivo_checkpoint <-  paste0("rais_", ano, "_completo.rds")
+tryCatch({
+lista_dfs[[as.character(ano)]] <-  baixar_dados_por_ano(ano)
+saveRDS(lista_dfs[[as.character(ano)]], file = arquivo_checkpoint)
+message(paste("Checkpoint salvo:", arquivo_checkpoint))
+if (ano != anos[length(anos)]) {
+message("Aguardando 5 segundos antes do próximo download...")
+Sys.sleep(5)
+}
+}, error = function(e) {
+message(paste("ERRO FATAL ao baixar dados de", ano, ":", e$message))
+})
+}
+# ==================== PADRONIZAÇÃO DE TIPOS ========================
+padronizar_tipos <- function(df) {
+  df %>%
+    mutate(
+      ano    = as.integer(ano),
+      idade  = suppressWarnings(as.integer(idade)),
+      
+      # Remunerações para numérico
+      valor_remuneracao_media     = suppressWarnings(as.numeric(valor_remuneracao_media)),
+      valor_remuneracao_janeiro   = suppressWarnings(as.numeric(valor_remuneracao_janeiro)),
+      valor_remuneracao_fevereiro = suppressWarnings(as.numeric(valor_remuneracao_fevereiro)),
+      valor_remuneracao_marco     = suppressWarnings(as.numeric(valor_remuneracao_marco)),
+      valor_remuneracao_abril     = suppressWarnings(as.numeric(valor_remuneracao_abril)),
+      valor_remuneracao_maio      = suppressWarnings(as.numeric(valor_remuneracao_maio)),
+      valor_remuneracao_junho     = suppressWarnings(as.numeric(valor_remuneracao_junho)),
+      valor_remuneracao_julho     = suppressWarnings(as.numeric(valor_remuneracao_julho)),
+      valor_remuneracao_agosto    = suppressWarnings(as.numeric(valor_remuneracao_agosto)),
+      valor_remuneracao_setembro  = suppressWarnings(as.numeric(valor_remuneracao_setembro)),
+      valor_remuneracao_outubro   = suppressWarnings(as.numeric(valor_remuneracao_outubro)),
+      valor_remuneracao_novembro  = suppressWarnings(as.numeric(valor_remuneracao_novembro)),
+      valor_remuneracao_dezembro  = suppressWarnings(as.numeric(valor_remuneracao_dezembro)),
+      valor_salario_contratual    = suppressWarnings(as.numeric(valor_salario_contratual)),
+      
+      subsetor_ibge = as.character(subsetor_ibge),
+      sigla_uf      = as.character(sigla_uf),
+      id_municipio  = as.character(id_municipio)
+    )
+}
+
+message("Padronizando tipos de dados...")
+lista_dfs <- lapply(lista_dfs, padronizar_tipos)
+
+# =================== COMBINAÇÃO E SALVAMENTO =======================
+message("Combinando dataframes...")
+df <- dplyr::bind_rows(lista_dfs)
+
+# Converte para data.table
+setDT(df)
+```
+
+Com isso chega-se na etapa final, de padronização dos tipos das colunas e consolidação em um único painel, onde posteriormente foi transformado em `data.table`, também foi criada uma variavel de salários reconstruida, afinal existem valores faltantes NAs na coluna original de remuneração da própria RAIS, sendo assim necessário reconstruir tal variável para realizar análises de forma consistente.
+
+```{r,message=FALSE}
+# Converter remunerações para numérico
+rem_cols <- grep("^valor_remuneracao_", names(df), value = TRUE)
+if (length(rem_cols)) {
+  df[, (rem_cols) := lapply(.SD, function(x) suppressWarnings(as.numeric(x))), .SDcols = rem_cols]
+}
+df[, valor_salario_contratual := suppressWarnings(as.numeric(valor_salario_contratual))]
+
+# Estratégia: média anual (valor_remuneracao_media) > média 12 meses > salário contratual
+if (length(rem_cols)) {
+  df[, media12 := rowMeans(.SD, na.rm = TRUE), .SDcols = rem_cols]
+} else {
+  df[, media12 := NA_real_]
+}
+
+df[, salario_aproximado := fifelse(!is.na(valor_remuneracao_media) & valor_remuneracao_media > 0,
+                                   valor_remuneracao_media, 
+                                   media12)]
+
+# Se ainda estiver NA ou não finito, usar salário contratual
+df[is.na(salario_aproximado) | !is.finite(salario_aproximado), salario_aproximado := valor_salario_contratual]
+
+# Remover coluna temporária
+df[, media12 := NULL]
+```
+
+## Processo de Agregação em Municipío-Ano
+
+com o `df` pronto, a agregação pode ser iniciada, para isso é recomendado o seguinte processo:
+
+**1) Variáveis auxiliares (sinalizadores)**\
+Antes de agregar, criamos marcadores binários que identificam o tipo de vínculo e recodificam raça/cor, além de um filtro de qualidade do salário:
+
+-   `eh_clt`: assume `1` quando `tipo_vinculo` contém “CLT” (detecção por `grepl(..., ignore.case=TRUE)`), indicando vínculos celetistas no setor privado.
+-   `eh_estatutario`: assume `1` quando `tipo_vinculo` contém “ESTATUTARIO\`, indicando vínculos típicos do setor público regidos por estatuto.
+-   `eh_adm_publica`: assume `1` em dois casos (lógica em “OU”):
+    -   quando `subsetor_ibge` ∈ {`"1"`, `"2"`}, que mapeiam Administração Pública;\
+    -   quando `cnae_1_descricao_secao` = “Administração pública, defesa e seguridade social”, reforçando a identificação via classificação de atividade (CNAE).\
+        Esse critério duplo aumenta a robustez para identificar setor público mesmo se alguma coluna vier faltante/inconsistente.
+-   `eh_empresa_estatal`: assume `1` quando `subsetor_ibge` ∈ {`"3"`, `"4"`}, cobrindo empresas estatais (públicas de direito privado).
+-   `raca_grupo`: consolida raça/cor em três categorias:
+    -   `"Branco"` para `raca_cor == "Branca"`;
+    -   `"Negro"` para `raca_cor` ∈ {`"Preta"`, `"Parda"`} (padrão usual IBGE/RAIS em estudos de desigualdade racial);
+    -   `"Outro"` para demais (ex.: Amarela, Indígena, Ignorado).
+-   `salario_valido`: define o salário usado nas médias. Recebe `salario_aproximado` quando não é NA e `≥ 500` (piso simples para remover zeros/valores implausíveis), caso contrário fica `NA`.\
+    \> *Observação:* `salario_aproximado` já foi construído com a hierarquia média anual → média das 12 remunerações → salário contratual.
+
+**2) Categorias de emprego mutuamente exclusivas**\
+Criamos `categoria_emprego` com ordem de precedência que evita dupla contagem:
+
+1.  Se `eh_adm_publica == 1` → `"Setor Público"`.
+2.  Senão, se `eh_empresa_estatal == 1` → `"Empresa Estatal"`.
+3.  Senão, se `eh_clt == 1` → `"CLT Privado"`.
+4.  Senão → `"Outros"`.
+
+Essa sequência garante que vínculos claramente públicos não “escapem” para CLT, e que estatais não contaminem o privado.
+
+**3) Recorte para salários válidos**\
+Para evitar viés por salários ausentes/zerados, filtramos `df` em `df_filtrado_salario <- df[!is.na(salario_valido)]`.\
+\> **Implicação:** as contagens `emprego_total`, `emprego_clt_privado`, `emprego_publico` passaram a refletir apenas vínculos com salário válido.
+
+**4) Agregação município-ano (tabela-mãe)**\
+A base principal por município-ano é construída em duas partes e depois mesclada:
+
+-   **Base geral (`base_geral_municipio`)**: por `(ano, id_municipio, id_municipio_nome, sigla_uf)`, calculamos:
+    -   `emprego_total`: número de vínculos com salário válido (`.N` no filtrado).
+    -   `emprego_clt_privado` e `emprego_publico`: contagens por `categoria_emprego`.
+    -   `salario_medio_total`, `salario_medio_clt`, `salario_medio_publico`: médias simples do `salario_valido` nos respectivos subconjuntos (com `na.rm = TRUE`).
+-   **Base por raça (`base_raca_municipio`)**: ainda restrita a salários válidos, e apenas para `raca_grupo ∈ {"Branco","Negro"}`:
+    -   Contagens: `n_brancos_total`, `n_negros_total`, e equivalentes em CLT Privado\*\* e Setor Público.
+    -   Médias: `salario_branco_total`, `salario_negro_total`, e as médias por raça dentro de CLT e Público.
+
+Em seguida, ocorre o `merge` por `(ano, id_municipio)` para formar a tabela-mãe municipal (`base_municipio`), preservando os rótulos de município/UF vindos da base geral.
+
+**5) Indicadores de desigualdade racial (razões)**\
+Calculamos as razões **Branco/Negro** para: - `razao_total` = `salario_branco_total` / `salario_negro_total`; - `razao_clt` = `salario_branco_clt` / `salario_negro_clt`; - `razao_publico` = `salario_branco_publico` / `salario_negro_publico`.
+
+Qualquer razão **não-finita** (por divisor zero, ausência total de um grupo) é setada para `NA` — evita `Inf`/`NaN` poluindo mapas/gráficos.
+
+**6) Gênero (como detectar e agregar)**\
+A coluna `sexo` já está presente desde a query (via dicionário). No trecho mostrado, ainda não agregamos por gênero, mas o procedimento é análogo ao da raça: - Recodifique para algo como `sexo_grupo` ∈ {`"Homem"`, `"Mulher"`} (ou conforme as categorias da RAIS). - Replique os cálculos de contagens e médias por total / CLT Privado / Setor Público.
+
+```{r, message = FALSE}
+df[, `:=`(
+  # 1) Regime de trabalho
+  eh_clt         = fifelse(grepl("CLT", tipo_vinculo, ignore.case = TRUE), 1L, 0L),
+  eh_estatutario = fifelse(grepl("ESTATUTARIO", tipo_vinculo, ignore.case = TRUE), 1L, 0L),
+  
+  # 2) Setor público (metodologia corrigida)
+  eh_adm_publica = fcase(
+    subsetor_ibge %in% c("1", "2"), 1L,
+    cnae_1_descricao_secao == "Administração pública, defesa e seguridade social", 1L,
+    default = 0L
+  ),
+  
+  # 3) Empresas estatais (subsetor 3 e 4 do IBGE)
+  eh_empresa_estatal = fifelse(subsetor_ibge %in% c("3", "4"), 1L, 0L),
+  
+  # 4) Grupo de raça
+  raca_grupo = fcase(
+    raca_cor == "Branca", "Branco",
+    raca_cor %in% c("Preta", "Parda"), "Negro",
+    default = "Outro"
+  ),
+  
+  # 5) Salário válido (corte inferior para depuração de outliers e zeros)
+  salario_valido = fifelse(!is.na(salario_aproximado) & salario_aproximado >= 500, salario_aproximado, NA_real_)
+)]
+
+# ============================================================================
+# 1.2. CATEGORIAS MUTUAMENTE EXCLUSIVAS
+# ============================================================================
+cat("Criando categorias mutuamente exclusivas...\n")
+df[, categoria_emprego := fcase(
+  eh_adm_publica == 1,          "Setor Público",
+  eh_empresa_estatal == 1,      "Empresa Estatal",
+  eh_clt == 1,                  "CLT Privado",
+  default =                     "Outros"
+)]
+
+# ============================================================================
+# 1.3. AGREGAÇÃO MUNICÍPIO-ANO (LÓGICA CORRIGIDA)
+# ============================================================================
+cat("\nAgregando dados por município-ano (Versão Corrigida)...\n")
+
+df_filtrado_salario <- df[!is.na(salario_valido)]
+
+base_geral_municipio <- df_filtrado_salario[, .(
+  emprego_total        = .N,
+  emprego_clt_privado  = sum(categoria_emprego == "CLT Privado"),
+  emprego_publico      = sum(categoria_emprego == "Setor Público"),
+  salario_medio_total  = mean(salario_valido, na.rm = TRUE),
+  salario_medio_clt    = mean(salario_valido[categoria_emprego == "CLT Privado"], na.rm = TRUE),
+  salario_medio_publico= mean(salario_valido[categoria_emprego == "Setor Público"], na.rm = TRUE)
+), by = .(ano, id_municipio, id_municipio_nome, sigla_uf)]
+
+base_raca_municipio <- df_filtrado_salario[raca_grupo %in% c("Branco", "Negro"), .(
+  n_brancos_total     = sum(raca_grupo == "Branco"),
+  n_negros_total      = sum(raca_grupo == "Negro"),
+  n_brancos_clt       = sum(raca_grupo == "Branco" & categoria_emprego == "CLT Privado"),
+  n_negros_clt        = sum(raca_grupo == "Negro"  & categoria_emprego == "CLT Privado"),
+  n_brancos_publico   = sum(raca_grupo == "Branco" & categoria_emprego == "Setor Público"),
+  n_negros_publico    = sum(raca_grupo == "Negro"  & categoria_emprego == "Setor Público"),
+  salario_branco_total   = mean(salario_valido[raca_grupo == "Branco"], na.rm = TRUE),
+  salario_branco_clt     = mean(salario_valido[raca_grupo == "Branco" & categoria_emprego == "CLT Privado"], na.rm = TRUE),
+  salario_branco_publico = mean(salario_valido[raca_grupo == "Branco" & categoria_emprego == "Setor Público"], na.rm = TRUE),
+  salario_negro_total    = mean(salario_valido[raca_grupo == "Negro"], na.rm = TRUE),
+  salario_negro_clt      = mean(salario_valido[raca_grupo == "Negro"  & categoria_emprego == "CLT Privado"], na.rm = TRUE),
+  salario_negro_publico  = mean(salario_valido[raca_grupo == "Negro"  & categoria_emprego == "Setor Público"], na.rm = TRUE)
+), by = .(ano, id_municipio)]
+
+base_municipio <- merge(
+  base_geral_municipio,
+  base_raca_municipio,
+  by = c("ano", "id_municipio")
+)
+
+base_municipio[, `:=`(
+  razao_total   = salario_branco_total   / salario_negro_total,
+  razao_clt     = salario_branco_clt     / salario_negro_clt,
+  razao_publico = salario_branco_publico / salario_negro_publico
+)]
+
+base_municipio[, `:=`(
+  razao_total   = fifelse(is.finite(razao_total),   razao_total,   NA_real_),
+  razao_clt     = fifelse(is.finite(razao_clt),     razao_clt,     NA_real_),
+  razao_publico = fifelse(is.finite(razao_publico), razao_publico, NA_real_)
+)]
+
+cat("Base agregada municipal corrigida criada com", nrow(base_municipio), "observações\n")
+saveRDS(base_municipio, "base_municipio_ano.rds")
+data.table::fwrite(base_municipio, "base_municipio_ano.csv")
+```
+
+Gerando uma base com 16693 linhas e 22 colunas, referentes a municipíos distintos nos 3 anos solicitados. 
+
+# Resultados para os Indicadores
+
+Após isso foram gerados os seguintes indicadores e suas respectivas vizualizações:
+
+**Razão Salarial média entre Brancos e Negros**
+
+![](images/36452d89-5854-4b4f-91d4-8500ffef7270.png)
+
+O gráfico mostra a persistência de um hiato salarial racial no emprego formal entre 2010 e 2018: a razão entre o salário médio de brancos e negros permanece em torno de 1,30–1,35, o que implica que, em média, trabalhadores negros recebem cerca de 74–77% do salário dos brancos. Observa-se ainda que o diferencial é sistematicamente menor no setor público do que no emprego CLT privado, coerente com a maior padronização remuneratória do funcionalismo.
+
+Ao longo do período, há leve aumento do gap, especialmente após a recessão de meados da década ,sugerindo estagnação ou pequena deterioração da convergência racial no mercado formal.
+
+Não obstante, uma outra forma de analisar essa dispariedade é verificar as distribuições dessas razões. Considerando a RAIS de 2018, o último ano da base observa-se o seguinte resultado: a distribuição municipal da razão salarial concentra-se levemente **acima de 1** em ambos os setores, com **mediana** um pouco menor no **setor público** do que no **CLT**, o que sugere um “típico” município público ligeiramente mais igualitário.
+
+Ao mesmo tempo, o público exibe cauda direita mais longa (muitos municípios com razões \>1,7 e alguns \>2,0), elevando a **média** (diamante) e revelando maior heterogeneidade. No CLT, a massa é mais concentrada entre \~1,05–1,25, indicando um gap “típico” de 8–25% mais estável territorialmente. Observações com razão \<1 existem, mas são raras e provavelmente refletem efeitos de composição ou células pequenas. Para robustez, vale impor amostra mínima por município-categoria, ponderar por nº de vínculos válidos e reportar também a mediana (ou médias truncadas).
+
+![](images/2ee79318-937c-4626-805a-fd748f967f29.png)
+
+![](images/fbc36a9a-ec0f-48cb-8699-6fcd52864838.png)
+
+![](images/d616d77e-ebb5-4b98-b992-117531f8609b.png)
+
+Por fim, tal dispariedade pode ser verificada também geograficamente pelos seguintes mapas:
+
+![](images/bcc66932-ae2d-4d5a-809c-f2c88cea55d5.png)
+
+![](images/1503a371-203a-4895-a584-85f1b360d4b3.png)
+
+
+
+## Índices de Emprego e Salários
+
+Entre 2010 e 2018, o estoque de vínculos formais segue o ciclo já observado: expansão até 2014 (puxada pelo CLT) e retração até 2018, enquanto o setor público cresce de forma mais lenta e contínua, exatamente o que os mapas e as densidades por categoria sugerem (CLT mais disperso; público mais concentrado).
+
+![](images/0ee04d69-4cba-4827-ae64-0611455db92e.png)
+
+![](images/3a0b4294-16a0-47af-9625-de2dbbfba0f2.png)
+
+![](images/e9f8d311-0b28-43be-ab62-bd5cf1f6e243.png)
+
+No plano remuneratório, os salários médios nominais sobem em todas as categorias e permanecem mais altos no setor público, mas isso não reduz o diferencial racial: as linhas por raça são quase paralelas e o gap branco–negro se mantém, com razão \~1,30–1,35 no CLT e ligeiramente menor no público (≈1,28–1,31), reproduzindo o padrão visto nos gráficos de evolução e nos histogramas (público com mediana menor e cauda direita mais longa).
+
+![](images/465d7cfa-728d-493d-bbd4-2b78593c2326.png)
+
+![](images/00dcd185-ba0a-4849-829f-2f221a6decc7.png)
+
+![](images/363dd425-48a7-4509-b59b-7d08750b9162.png)
+
+![](images/643a90c3-2754-4c13-9090-9902135307c6.png)
+
+Em síntese, os mapas “carimbam” no território o que os gráficos já mostraram: a concentração do emprego formal nas metrópoles e eixos industriais (mapa log de vínculos) e a presença de hotspots salariais nas mesmas áreas, com níveis mais altos e maior complexidade ocupacional; ao mesmo tempo, o setor público aparece mais espalhado pelo país e com salários médios superiores, mas sem eliminar o gap racial — que no CLT surge de forma mais sistemática (razões branco/negro acima de 1 em grande parte dos municípios) e, no público, combina mediana menor com heterogeneidade maior e bolsões de alta desigualdade. Pontos muito claros de salário em municípios pequenos reforçam a sensibilidade a efeitos de composição (poucos vínculos bem pagos). Assim, os mapas traduzem espacialmente o ciclo 2010–2018 e consolidam a narrativa empírica: mercados locais maiores concentram vínculos e remunerações, o setor público paga mais, e a desigualdade racial permanece estrutural, variando de intensidade conforme a estrutura produtiva e ocupacional de cada lugar.
+
+![](images/mapa_salario_medio_total_2018_corrigido.png)
+
+![](images/mapa_emprego_total_2018_corrigido.png)
+
+Em suma, os resultados mostram que, no emprego formal brasileiro, a desigualdade salarial por raça é persistente e estrutural: entre 2010 e 2018, o salário médio de brancos supera o de negros de forma sistemática (razão em torno de 1,30–1,35 no CLT e ligeiramente menor no setor público), com pouca convergência e até leve piora após a recessão de meados da década. O ciclo econômico aparece com clareza (expansão do CLT até 2014 e recuo até 2018, enquanto o público cresce lentamente) e os mapas “imprimem” essa narrativa no território: grandes centros concentram vínculos e hotspots salariais e tendem a exibir hiatos maiores no privado, ao passo que o setor público combina mediana mais baixa do gap com maior heterogeneidade entre municípios.
+
+As distribuições confirmam linhas quase paralelas por raça e níveis salariais mais altos no público, sem eliminação do diferencial. Esses achados devem ser lidos com cautelas conhecidas da RAIS (não resposta de cor/raça—sobretudo no público—, sensibilidade de médias a células pequenas e contagem por vínculos, não por pessoas), mas o quadro geral é consistente: mercados locais maiores e complexos pagam melhor, o setor público é mais remunerado e menos desigual no centro da distribuição, e o gap racial permanece amplo, sugerindo a necessidade de políticas focalizadas de inclusão e progressão ocupacional, além de melhorias na qualidade e cobertura da variável raça.
+
+```{r,message = FALSE}
+#Vizualizações
+agregados_temporais <- base_municipio[, .(
+  emprego_total_nacional   = sum(emprego_total,       na.rm = TRUE),
+  emprego_clt_nacional     = sum(emprego_clt_privado, na.rm = TRUE),
+  emprego_publico_nacional = sum(emprego_publico,     na.rm = TRUE),
+  
+  salario_medio_total_nacional   = weighted.mean(salario_medio_total,   w = emprego_total,       na.rm = TRUE),
+  salario_medio_clt_nacional     = weighted.mean(salario_medio_clt,     w = emprego_clt_privado, na.rm = TRUE),
+  salario_medio_publico_nacional = weighted.mean(salario_medio_publico, w = emprego_publico,     na.rm = TRUE),
+  
+  razao_media_total_nacional   = weighted.mean(razao_total,   w = (n_brancos_total   + n_negros_total),   na.rm = TRUE),
+  razao_media_clt_nacional     = weighted.mean(razao_clt,     w = (n_brancos_clt     + n_negros_clt),     na.rm = TRUE),
+  razao_media_publico_nacional = weighted.mean(razao_publico, w = (n_brancos_publico + n_negros_publico), na.rm = TRUE)
+), by = ano]
+
+setorder(agregados_temporais, ano)
+cat("\n=== TABELA TEMPORAL: EMPREGO TOTAL NACIONAL ===\n")
+print(agregados_temporais[, .(ano, emprego_total_nacional, emprego_clt_nacional, emprego_publico_nacional)])
+cat("\n=== TABELA TEMPORAL: SALÁRIO MÉDIO NACIONAL (PONDERADO) ===\n")
+print(agregados_temporais[, .(ano, salario_medio_total_nacional, salario_medio_clt_nacional, salario_medio_publico_nacional)])
+cat("\n=== TABELA TEMPORAL: RAZÃO SALARIAL BRANCO/NEGRO NACIONAL (PONDERADA) ===\n")
+print(agregados_temporais[, .(ano, razao_media_total_nacional, razao_media_clt_nacional, razao_media_publico_nacional)])
+
+# ============================================================================
+# 3. VISUALIZAÇÃO: EVOLUÇÃO TEMPORAL (RAZÃO SALARIAL)
+# ============================================================================
+cat("\nGerando gráfico de evolução temporal (Razão Salarial)...\n")
+evolucao_long_razao <- melt(
+  agregados_temporais[, .(ano, razao_media_clt_nacional, razao_media_publico_nacional)], 
+  id.vars = "ano", variable.name = "categoria", value.name = "razao"
+)
+evolucao_long_razao[, categoria := fcase(
+  categoria == "razao_media_clt_nacional",     "CLT Privado",
+  categoria == "razao_media_publico_nacional", "Setor Público"
+)]
+evolucao_long_razao[, categoria := factor(categoria, levels = c("CLT Privado", "Setor Público"))]
+
+anos_disponiveis <- sort(unique(base_municipio$ano))
+
+ggplot(evolucao_long_razao, aes(x = ano, y = razao, color = categoria, group = categoria)) +
+  geom_line(size = 1.5) +
+  geom_point(size = 4) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red", size = 1) +
+  scale_color_manual(values = c("CLT Privado" = "#E67E22", "Setor Público" = "#2ECC71")) +
+  scale_x_continuous(breaks = anos_disponiveis) +
+  scale_y_continuous(breaks = seq(1.0, 1.5, 0.05), limits = c(0.95, 1.5)) +
+  labs(
+    title = "Evolução da Desigualdade Salarial Racial por Categoria",
+    subtitle = "Razão média ponderada (por município) entre salário de brancos e negros",
+    x = "Ano", y = "Razão Salário Médio Branco / Negro", color = "Categoria",
+    caption = "Fonte: RAIS. (Sem filtro de amostra mínima).\nCLT Privado = setor privado. Setor Público = administração direta."
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 12, color = "gray30"),
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+ggsave("evolucao_razao_salarial_sem_filtro.png", width = 12, height = 8, dpi = 300)
+
+# ============================================================================
+# 4. VISUALIZAÇÃO: DISTRIBUIÇÃO RAZÃO SALARIAL (DENSIDADE, HISTOGRAMA, BOXPLOT)
+# ============================================================================
+cat("\nGerando gráficos de distribuição (Razão Salarial) para o ano mais recente...\n")
+ano_mapa  <- max(base_municipio$ano)
+dados_mapa <- base_municipio[ano == ano_mapa]
+
+dados_dist_long <- melt(
+  dados_mapa[, .(id_municipio, razao_clt, razao_publico)], 
+  id.vars = "id_municipio", measure.vars = c("razao_clt", "razao_publico"),
+  variable.name = "categoria", value.name = "razao"
+)
+dados_dist_long[, categoria := fcase(
+  categoria == "razao_clt",     "CLT Privado",
+  categoria == "razao_publico", "Setor Público"
+)]
+dados_dist_long[, categoria := factor(categoria, levels = c("CLT Privado", "Setor Público"))]
+dados_dist_long_filtrado_viz <- dados_dist_long[!is.na(razao) & razao > 0.25 & razao < 3.0]
+
+# Densidade
+ggplot(dados_dist_long_filtrado_viz, aes(x = razao, fill = categoria)) +
+  geom_density(alpha = 0.7) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "red", size = 1) +
+  scale_fill_manual(values = c("CLT Privado" = "#E67E22", "Setor Público" = "#2ECC71")) +
+  scale_x_continuous(breaks = seq(0, 3, 0.25)) +
+  labs(
+    title = paste0("Distribuição da Desigualdade Salarial Racial (", ano_mapa, ")"),
+    subtitle = "Distribuição da razão salarial Brancos/Negros pelos municípios",
+    x = "Razão Salário Médio Branco / Negro", y = "Densidade", fill = "Categoria:",
+    caption = paste0("Fonte: RAIS ", ano_mapa, ". (Sem filtro de amostra mínima).")
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom")
+ggsave(paste0("distribuicao_densidade_", ano_mapa, "_sem_filtro.png"), width = 12, height = 7, dpi = 300)
+
+# Histogramas
+ggplot(dados_dist_long_filtrado_viz, aes(x = razao, fill = categoria)) +
+  geom_histogram(binwidth = 0.05, alpha = 0.9, color = "white") +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "red", size = 1) +
+  facet_wrap(~categoria, ncol = 1, scales = "free_y") +
+  scale_fill_manual(values = c("CLT Privado" = "#E67E22", "Setor Público" = "#2ECC71")) +
+  scale_x_continuous(limits = c(0.5, 3.0), breaks = seq(0.5, 3.0, 0.25)) +
+  labs(
+    title = paste0("Histograma da Desigualdade Salarial Racial (", ano_mapa, ")"),
+    subtitle = "Número de municípios por faixa de razão salarial",
+    x = "Razão Salário Médio Branco / Negro", y = "Número de Municípios",
+    caption = paste0("Fonte: RAIS ", ano_mapa, ". (Sem filtro de amostra mínima).")
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none", strip.text = element_text(face = "bold", size = 12))
+ggsave(paste0("distribuicao_histograma_", ano_mapa, "_sem_filtro.png"), width = 10, height = 8, dpi = 300)
+
+# Boxplots
+ggplot(dados_dist_long_filtrado_viz, aes(x = categoria, y = razao, fill = categoria)) +
+  geom_boxplot(alpha = 0.7, outlier.alpha = 0.2) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red", size = 1) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 4, fill = "white") +
+  scale_fill_manual(values = c("CLT Privado" = "#E67E22", "Setor Público" = "#2ECC71")) +
+  scale_y_continuous(limits = c(0.5, 2.5), breaks = seq(0.5, 2.5, 0.25)) +
+  labs(
+    title = paste0("Dispersão da Desigualdade por Categoria (", ano_mapa, ")"),
+    subtitle = "Cada ponto é um município. Diamante = média. Linha = mediana.",
+    x = NULL, y = "Razão Salário Médio Branco / Negro",
+    caption = paste0("Fonte: RAIS ", ano_mapa, ". (Sem filtro de amostra mínima).")
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")
+ggsave(paste0("distribuicao_boxplot_", ano_mapa, "_sem_filtro.png"), width = 8, height = 7, dpi = 300)
+
+# ============================================================================
+# 5. VISUALIZAÇÃO: MAPAS E DISPERSÃO RAZÃO SALARIAL (SEM FILTRO)
+# ============================================================================
+cat("\nGerando mapas e gráfico de dispersão (Razão Salarial)...\n")
+cat("Baixando dados geoespaciais dos municípios...\n")
+
+# Geobr geralmente possui shapes em 2010 e 2020; escolher o mais próximo
+shape_year <- ifelse(ano_mapa <= 2010, 2010, 2020)
+municipios_sf <- read_municipality(year = shape_year, showProgress = FALSE)
+
+# Garantir code_muni numérico para o join
+dados_mapa[, code_muni := as.numeric(id_municipio)]
+
+# Mesclar shapes com base municipal (left join para manter geometria)
+cat("Mesclando dados municipais com shapes geoespaciais...\n")
+dados_mapa_sf <- municipios_sf %>%
+  dplyr::left_join(dplyr::select(dados_mapa, -id_municipio_nome, -sigla_uf), by = "code_muni")
+
+# Mapa 1: Razão CLT Privado
+cat("Gerando mapa da desigualdade (CLT Privado)...\n")
+dados_mapa_sf_clt <- dados_mapa_sf[!is.na(dados_mapa_sf$razao_clt) & dados_mapa_sf$razao_clt < 5,]
+ggplot(dados_mapa_sf_clt) +
+  geom_sf(aes(fill = razao_clt), color = NA) +
+  scale_fill_viridis_c(
+    option = "plasma", direction = -1,
+    name = "Razão Branco/Negro\n(CLT Privado)",
+    breaks = c(1, 1.25, 1.5, 1.75, 2),
+    labels = c("1.0 (Igualdade)", "1.25", "1.5", "1.75", "2.0")
+  ) +
+  labs(
+    title = paste0("Desigualdade Salarial Racial (CLT Privado) por Município (", ano_mapa, ")"),
+    subtitle = "Razão Salário Médio Branco / Negro. (Sem filtro de amostra mínima)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 12, color = "gray30"),
+    legend.position = "right",
+    axis.text = element_blank(), axis.title = element_blank()
+  )
+ggsave(paste0("mapa_desigualdade_clt_", ano_mapa, "_sem_filtro.png"), width = 12, height = 10, dpi = 300)
+
+# Mapa 2: Razão Setor Público
+cat("Gerando mapa da desigualdade (Setor Público)...\n")
+dados_mapa_sf_publico <- dados_mapa_sf[!is.na(dados_mapa_sf$razao_publico) & dados_mapa_sf$razao_publico < 5,]
+ggplot(dados_mapa_sf_publico) +
+  geom_sf(aes(fill = razao_publico), color = NA) +
+  scale_fill_viridis_c(
+    option = "plasma", direction = -1,
+    name = "Razão Branco/Negro\n(Setor Público)",
+    breaks = c(1, 1.25, 1.5, 1.75, 2),
+    labels = c("1.0 (Igualdade)", "1.25", "1.5", "1.75", "2.0")
+  ) +
+  labs(
+    title = paste0("Desigualdade Salarial Racial (Setor Público) por Município (", ano_mapa, ")"),
+    subtitle = "Razão Salário Médio Branco / Negro. (Sem filtro de amostra mínima)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 12, color = "gray30"),
+    legend.position = "right",
+    axis.text = element_blank(), axis.title = element_blank()
+  )
+ggsave(paste0("mapa_desigualdade_publico_", ano_mapa, "_sem_filtro.png"), width = 12, height = 10, dpi = 300)
+
+# Dispersão CLT vs. Público
+dados_dispersao <- dados_mapa[!is.na(razao_clt) & !is.na(razao_publico) & razao_clt < 5 & razao_publico < 5]
+if (nrow(dados_dispersao) > 0) {
+  cat("Gerando gráfico de dispersão CLT vs. Setor Público...\n")
+  ggplot(dados_dispersao, aes(x = razao_clt, y = razao_publico)) +
+    geom_point(alpha = 0.6, size = 2, aes(color = sigla_uf)) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray") +
+    geom_hline(yintercept = 1, linetype = "dotted", color = "red") +
+    geom_vline(xintercept = 1, linetype = "dotted", color = "red") +
+    scale_color_viridis_d(option = "viridis", name = "UF", guide = "none") +
+    scale_x_continuous(limits = c(0.8, 2.5), breaks = seq(0.8, 2.5, 0.2)) +
+    scale_y_continuous(limits = c(0.8, 2.5), breaks = seq(0.8, 2.5, 0.2)) +
+    labs(
+      title    = paste0("Comparativo da Desigualdade Salarial Racial (", ano_mapa, ")"),
+      subtitle = "Cada ponto é um município: Razão Branco/Negro no CLT Privado vs. Setor Público",
+      x        = "Razão Salário Branco/Negro (CLT Privado)",
+      y        = "Razão Salário Branco/Negro (Setor Público)",
+      caption  = "Fonte: RAIS. Linha tracejada = igualdade entre categorias."
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", size = 16),
+      plot.subtitle = element_text(size = 12, color = "gray30"),
+      legend.position = "right"
+    )
+  ggsave(paste0("dispersao_clt_vs_publico_", ano_mapa, "_sem_filtro.png"), width = 12, height = 8, dpi = 300)
+} else {
+  cat("WARN: Não há dados suficientes para o gráfico de dispersão.\n")
+}
+
+# ============================================================================
+# 6. VISUALIZAÇÃO: EVOLUÇÃO DE EMPREGO E SALÁRIOS GERAIS
+# ============================================================================
+cat("\nGerando gráficos de evolução de Emprego e Salários Médios Gerais...\n")
+
+# Evolução do Emprego Nacional
+emprego_long <- melt(
+  agregados_temporais, id.vars = "ano",
+  measure.vars = c("emprego_total_nacional", "emprego_clt_nacional", "emprego_publico_nacional"),
+  variable.name = "categoria", value.name = "vinculos"
+)
+emprego_long[, categoria := fcase(
+  categoria == "emprego_total_nacional",   "Total",
+  categoria == "emprego_clt_nacional",     "CLT Privado",
+  categoria == "emprego_publico_nacional", "Setor Público"
+)]
+emprego_long[, categoria := factor(categoria, levels = c("Total", "CLT Privado", "Setor Público"))]
+
+ggplot(emprego_long, aes(x = ano, y = vinculos, color = categoria, group = categoria)) +
+  geom_line(size = 1.5) + geom_point(size = 4) +
+  scale_color_manual(values = c("Total" = "#3498DB", "CLT Privado" = "#E67E22", "Setor Público" = "#2ECC71")) +
+  scale_x_continuous(breaks = anos_disponiveis) +
+  scale_y_continuous(labels = label_number(unit = "M", scale = 1e-6, accuracy = 0.1)) +
+  labs(
+    title = "Evolução do Emprego Nacional por Categoria",
+    subtitle = "Número de vínculos de trabalho (todos com salário válido)",
+    x = "Ano", y = "Número de Vínculos (em Milhões)", color = "Categoria",
+    caption = "Fonte: RAIS. (Sem filtro de amostra mínima)."
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom", plot.title = element_text(face = "bold", size = 16))
+ggsave("evolucao_emprego_nacional.png", width = 12, height = 8, dpi = 300)
+
+# Evolução do Salário Médio Nacional
+salario_medio_long <- melt(
+  agregados_temporais, id.vars = "ano",
+  measure.vars = c("salario_medio_total_nacional", "salario_medio_clt_nacional", "salario_medio_publico_nacional"),
+  variable.name = "categoria", value.name = "salario"
+)
+salario_medio_long[, categoria := fcase(
+  categoria == "salario_medio_total_nacional",   "Total",
+  categoria == "salario_medio_clt_nacional",     "CLT Privado",
+  categoria == "salario_medio_publico_nacional", "Setor Público"
+)]
+salario_medio_long[, categoria := factor(categoria, levels = c("Total", "CLT Privado", "Setor Público"))]
+
+ggplot(salario_medio_long, aes(x = ano, y = salario, color = categoria, group = categoria)) +
+  geom_line(size = 1.5) + geom_point(size = 4) +
+  scale_color_manual(values = c("Total" = "#3498DB", "CLT Privado" = "#E67E22", "Setor Público" = "#2ECC71")) +
+  scale_x_continuous(breaks = anos_disponiveis) +
+  scale_y_continuous(labels = label_dollar(prefix = "R$ ", big.mark = ".", decimal.mark = ",")) +
+  labs(
+    title = "Evolução do Salário Médio Nacional por Categoria",
+    subtitle = "Salário médio ponderado (todos os trabalhadores com salário válido)",
+    x = "Ano", y = "Salário Médio (R$)", color = "Categoria",
+    caption = "Fonte: RAIS. (Sem filtro de amostra mínima)."
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom", plot.title = element_text(face = "bold", size = 16))
+ggsave("evolucao_salario_medio_nacional.png", width = 12, height = 8, dpi = 300)
+
+# Evolução do Salário Médio por Raça e Categoria
+cat("Calculando agregados de salário por raça...\n")
+agregados_raca_salario <- base_municipio[, .(
+  salario_branco_total    = weighted.mean(salario_branco_total,    w = n_brancos_total,    na.rm = TRUE),
+  salario_negro_total     = weighted.mean(salario_negro_total,     w = n_negros_total,     na.rm = TRUE),
+  salario_branco_clt      = weighted.mean(salario_branco_clt,      w = n_brancos_clt,      na.rm = TRUE),
+  salario_negro_clt       = weighted.mean(salario_negro_clt,       w = n_negros_clt,       na.rm = TRUE),
+  salario_branco_publico  = weighted.mean(salario_branco_publico,  w = n_brancos_publico,  na.rm = TRUE),
+  salario_negro_publico   = weighted.mean(salario_negro_publico,   w = n_negros_publico,   na.rm = TRUE)
+), by = ano]
+
+salario_raca_long <- melt(
+  agregados_raca_salario, id.vars = "ano",
+  measure.vars = c("salario_branco_total", "salario_negro_total",
+                   "salario_branco_clt", "salario_negro_clt",
+                   "salario_branco_publico", "salario_negro_publico"),
+  variable.name = "categoria_cod", value.name = "salario"
+)
+
+salario_raca_long[, raca := fcase(
+  grepl("branco", categoria_cod, ignore.case = TRUE), "Branco",
+  grepl("negro",  categoria_cod, ignore.case = TRUE), "Negro"
+)]
+salario_raca_long[, categoria := fcase(
+  grepl("total",   categoria_cod, ignore.case = TRUE), "Total",
+  grepl("clt",     categoria_cod, ignore.case = TRUE), "CLT Privado",
+  grepl("publico", categoria_cod, ignore.case = TRUE), "Setor Público"
+)]
+salario_raca_long[, categoria := factor(categoria, levels = c("Total", "CLT Privado", "Setor Público"))]
+salario_raca_long[, raca := factor(raca, levels = c("Branco", "Negro"))]
+
+ggplot(salario_raca_long, aes(x = ano, y = salario, color = raca, linetype = categoria, group = interaction(raca, categoria))) +
+  geom_line(size = 1.3) +
+  geom_point(size = 3, aes(shape = raca)) +
+  scale_color_manual(values = c("Branco" = "#0072B2", "Negro" = "#D55E00")) +
+  scale_linetype_manual(values = c("Total" = "solid", "CLT Privado" = "dashed", "Setor Público" = "dotted")) +
+  scale_shape_manual(values = c(17, 16)) +
+  scale_x_continuous(breaks = anos_disponiveis) +
+  scale_y_continuous(labels = label_dollar(prefix = "R$ ", big.mark = ".", decimal.mark = ",")) +
+  labs(
+    title = "Evolução do Salário Médio Nacional por Raça e Categoria",
+    subtitle = "Salário médio ponderado. O 'gap' é a distância vertical entre as linhas.",
+    x = "Ano", y = "Salário Médio (R$)", color = "Raça/Cor:", linetype = "Categoria:", shape = "Raça/Cor:",
+    caption = "Fonte: RAIS. (Sem filtro de amostra mínima)."
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom", legend.box = "horizontal", plot.title = element_text(face = "bold", size = 16))
+ggsave("evolucao_salario_medio_por_raca_categoria.png", width = 12, height = 8, dpi = 300)
+
+# ============================================================================
+# 7. (NOVO) MAPAS E DISTRIBUIÇÃO DE EMPREGO E SALÁRIO
+# ============================================================================
+cat("\nGerando mapas e distribuições de Emprego Total e Salário Médio...\n")
+
+# Mapa de Emprego Total (escala log10)
+dados_mapa_sf_emprego <- dados_mapa_sf %>% 
+  dplyr::filter(!is.na(emprego_total) & emprego_total > 0)
+
+if (nrow(dados_mapa_sf_emprego) > 0) {
+  ggplot(dados_mapa_sf_emprego) +
+    geom_sf(aes(fill = log10(emprego_total)), color = NA) +
+    scale_fill_viridis_c(
+      option = "cividis",
+      name = "Nº de Vínculos\n(Escala Log10)",
+      breaks = c(1, 2, 3, 4, 5, 6),
+      labels = c("10", "100", "1.000", "10.000", "100.000", "1.000.000")
+    ) +
+    labs(
+      title = paste0("Distribuição de Emprego Total por Município (", ano_mapa, ")"),
+      subtitle = "Número de vínculos (todos com salário válido). Escala logarítmica."
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(plot.title = element_text(face = "bold", size = 16),
+          legend.position = "right", axis.text = element_blank(), axis.title = element_blank())
+  ggsave(paste0("mapa_emprego_total_", ano_mapa, "_corrigido.png"), width = 12, height = 10, dpi = 300)
+} else {
+  cat("WARN: Não há dados válidos para gerar o mapa de Emprego Total após filtros.\n")
+}
+
+# Mapa de Salário Médio Total
+dados_mapa_sf_salario <- dados_mapa_sf %>%
+  dplyr::filter(!is.na(salario_medio_total) & salario_medio_total > 500 & salario_medio_total < 15000)
+
+if (nrow(dados_mapa_sf_salario) > 0) {
+  ggplot(dados_mapa_sf_salario) +
+    geom_sf(aes(fill = salario_medio_total), color = NA) +
+    scale_fill_viridis_c(
+      option = "inferno",
+      name = "Salário Médio\n(R$)",
+      labels = label_dollar(prefix = "R$ ", big.mark = ".", decimal.mark = ",")
+    ) +
+    labs(
+      title = paste0("Distribuição do Salário Médio Total por Município (", ano_mapa, ")"),
+      subtitle = "Salário médio de todos os trabalhadores (com salário válido)."
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(plot.title = element_text(face = "bold", size = 16),
+          legend.position = "right", axis.text = element_blank(), axis.title = element_blank())
+  ggsave(paste0("mapa_salario_medio_total_", ano_mapa, "_corrigido.png"), width = 12, height = 10, dpi = 300)
+} else {
+  cat("WARN: Não há dados válidos para gerar o mapa de Salário Médio Total após filtros.\n")
+}
+
+# Distribuição do Salário Médio por Raça (Total)
+cat("Gerando gráfico de distribuição de Salário Médio por Raça...\n")
+dados_salario_raca_long <- melt(
+  dados_mapa[, .(id_municipio, salario_branco_total, salario_negro_total)],
+  id.vars = "id_municipio",
+  measure.vars = c("salario_branco_total", "salario_negro_total"),
+  variable.name = "grupo_raca", value.name = "salario_medio"
+)
+dados_salario_raca_long[, grupo_raca := fcase(
+  grupo_raca == "salario_branco_total", "Brancos (Sal. Médio)",
+  grupo_raca == "salario_negro_total",  "Negros (Sal. Médio)"
+)]
+dados_salario_raca_long_viz <- dados_salario_raca_long[!is.na(salario_medio) & salario_medio < 15000]
+
+ggplot(dados_salario_raca_long_viz, aes(x = salario_medio, fill = grupo_raca)) +
+  geom_density(alpha = 0.7) +
+  scale_fill_manual(values = c("Brancos (Sal. Médio)" = "#0072B2", "Negros (Sal. Médio)" = "#D55E00")) +
+  scale_x_continuous(labels = label_dollar(prefix = "R$ ", big.mark = ".", decimal.mark = ","), limits = c(0, 10000)) +
+  labs(
+    title = paste0("Distribuição do Salário Médio Municipal por Raça (", ano_mapa, ")"),
+    subtitle = "Distribuição dos salários médios de brancos e negros entre os municípios.",
+    x = "Salário Médio Municipal (R$)", y = "Densidade", fill = "Grupo:"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom", plot.title = element_text(face = "bold", size = 16))
+ggsave(paste0("distribuicao_salario_medio_por_raca_", ano_mapa, ".png"), width = 12, height = 7, dpi = 300)
+
+# Distribuição do Salário por Raça e Categoria
+cat("Gerando gráfico de distribuição de Salário por Raça e Categoria...\n")
+dados_salario_raca_cat_long <- melt(
+  dados_mapa,
+  id.vars = "id_municipio",
+  measure.vars = c("salario_branco_clt", "salario_negro_clt", "salario_branco_publico", "salario_negro_publico"),
+  variable.name = "grupo", value.name = "salario_medio"
+)
+dados_salario_raca_cat_long[, raca := fcase(
+  grepl("branco", grupo, ignore.case = TRUE), "Branco",
+  grepl("negro",  grupo, ignore.case = TRUE), "Negro"
+)]
+dados_salario_raca_cat_long[, categoria := fcase(
+  grepl("clt",     grupo, ignore.case = TRUE), "CLT Privado",
+  grepl("publico", grupo, ignore.case = TRUE), "Setor Público"
+)]
+dados_salario_raca_cat_long[, categoria := factor(categoria, levels = c("CLT Privado", "Setor Público"))]
+dados_salario_raca_cat_long[, raca := factor(raca, levels = c("Branco", "Negro"))]
+dados_salario_raca_cat_long_viz <- dados_salario_raca_cat_long[!is.na(salario_medio) & salario_medio < 15000]
+
+ggplot(dados_salario_raca_cat_long_viz, aes(x = salario_medio, fill = raca)) +
+  geom_density(alpha = 0.7) +
+  facet_wrap(~categoria) +
+  scale_fill_manual(values = c("Branco" = "#0072B2", "Negro" = "#D55E00")) +
+  scale_x_continuous(labels = label_dollar(prefix = "R$ ", big.mark = ".", decimal.mark = ","), limits = c(0, 10000)) +
+  labs(
+    title = paste0("Distribuição do Salário Médio Municipal por Raça e Categoria (", ano_mapa, ")"),
+    subtitle = "Comparando a distribuição dos salários médios dentro de cada categoria.",
+    x = "Salário Médio Municipal (R$)", y = "Densidade", fill = "Raça/Cor:"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom", plot.title = element_text(face = "bold", size = 16),
+        strip.text = element_text(face = "bold", size = 12))
+ggsave(paste0("distribuicao_salario_raca_categoria_", ano_mapa, ".png"), width = 12, height = 7, dpi = 300)
+
+# Distribuição do Número de Vínculos por Categoria
+cat("Gerando gráfico de distribuição de vínculos por Categoria...\n")
+dados_emprego_cat_long <- melt(
+  dados_mapa[, .(id_municipio, emprego_clt_privado, emprego_publico)],
+  id.vars = "id_municipio",
+  measure.vars = c("emprego_clt_privado", "emprego_publico"),
+  variable.name = "categoria", value.name = "vinculos"
+)
+dados_emprego_cat_long[, categoria := fcase(
+  categoria == "emprego_clt_privado", "CLT Privado",
+  categoria == "emprego_publico",     "Setor Público"
+)]
+dados_emprego_cat_long_viz <- dados_emprego_cat_long[vinculos > 0]
+
+ggplot(dados_emprego_cat_long_viz, aes(x = vinculos, fill = categoria)) +
+  geom_density(alpha = 0.7) +
+  scale_x_log10(
+    breaks = c(1, 10, 100, 1000, 10000, 100000),
+    labels = c("1", "10", "100", "1k", "10k", "100k")
+  ) +
+  scale_fill_manual(values = c("CLT Privado" = "#E67E22", "Setor Público" = "#2ECC71")) +
+  labs(
+    title = paste0("Distribuição do Nº de Vínculos por Categoria entre Municípios (", ano_mapa, ")"),
+    subtitle = "Mostra como o número de empregos em cada setor varia entre os municípios.",
+    x = "Número de Vínculos (Escala Log10)", y = "Densidade", fill = "Categoria:"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom", plot.title = element_text(face = "bold", size = 16))
+ggsave(paste0("distribuicao_vinculos_categoria_", ano_mapa, ".png"), width = 12, height = 7, dpi = 300)
+
+# Distribuição do Número de Trabalhadores por Raça
+cat("Gerando gráfico de distribuição de vínculos por Raça...\n")
+dados_emprego_raca_long <- melt(
+  dados_mapa[, .(id_municipio, n_brancos_total, n_negros_total)],
+  id.vars = "id_municipio",
+  measure.vars = c("n_brancos_total", "n_negros_total"),
+  variable.name = "raca", value.name = "vinculos"
+)
+dados_emprego_raca_long[, raca := fcase(
+  raca == "n_brancos_total", "Brancos",
+  raca == "n_negros_total",  "Negros"
+)]
+dados_emprego_raca_long_viz <- dados_emprego_raca_long[vinculos > 0]
+
+ggplot(dados_emprego_raca_long_viz, aes(x = vinculos, fill = raca)) +
+  geom_density(alpha = 0.7) +
+  scale_x_log10(
+    breaks = c(1, 10, 100, 1000, 10000, 100000, 1000000),
+    labels = c("1", "10", "100", "1k", "10k", "100k", "1M")
+  ) +
+  scale_fill_manual(values = c("Brancos" = "#0072B2", "Negros" = "#D55E00")) +
+  labs(
+    title = paste0("Distribuição do Nº de Trabalhadores por Raça entre Municípios (", ano_mapa, ")"),
+    subtitle = "Mostra como o número de trabalhadores brancos e negros varia entre os municípios.",
+    x = "Número de Trabalhadores (Escala Log10)", y = "Densidade", fill = "Raça/Cor:"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom", plot.title = element_text(face = "bold", size = 16))
+ggsave(paste0("distribuicao_vinculos_raca_", ano_mapa, ".png"), width = 12, height = 7, dpi = 300)
+
+```
